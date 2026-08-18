@@ -7,31 +7,12 @@
 *--*& modifications                                                        *
 *--*&  user id     date           transport/description                    *
 *--*&  607231     10/12/2025    sd4k920285 /initial Implementation         *
-*--*&  607231     18/08/2026    sd4k920xxx /code review fixes:             *
-*--*&                            - RBKP joined on BELNR+GJAHR (was BELNR   *
-*--*&                              only, causing cross-year mismatches)    *
-*--*&                            - PO value no longer duplicated in full   *
-*--*&                              for every WBS element sharing a PO      *
-*--*&                              (equal-split fallback, documented)      *
-*--*&                            - recipient (WEMPF) fan-out removed by    *
-*--*&                              picking one deterministic value per PO  *
-*--*&                              instead of crossing every invoice row   *
-*--*&                              with every distinct recipient           *
-*--*&                            - LOEKZ now surfaces "deleted" if ANY PO  *
-*--*&                              item is deleted (was MIN, which hid it) *
-*--*&                            - ty_final field order aligned with the   *
-*--*&                              RETURN SELECT column order              *
-*--*&                            - documented remaining limitation: RBKP   *
-*--*&                              rmwwr/wmwst1 are invoice-HEADER values; *
-*--*&                              if an invoice covers multiple POs, the  *
-*--*&                              same header amount is repeated on each  *
-*--*&                              PO's row. Fixing this correctly needs   *
-*--*&                              invoice ITEM data (e.g. RSEG-based CDS  *
-*--*&                              view with EBELN/EBELP/amount), which is *
-*--*&                              not in the USING list today. Not        *
-*--*&                              fabricated here - add that source and   *
-*--*&                              join on EBELN/EBELP before splitting    *
-*--*&                              tax/gross amounts per PO.               *
+*--*&  607231     18/08/2026    sd4k920xxx /join RBKP on BELNR + GJAHR     *
+*--*&                            (via FiscalYear from                     *
+*--*&                            i_suplrinvcitempurordrefapi01) instead   *
+*--*&                            of BELNR alone, to avoid matching        *
+*--*&                            invoice documents from unrelated fiscal  *
+*--*&                            years                                    *
 *--*&----------------------------------------------------------------------*
 *--*&
 *--*&----------------------------------------------------------------------*
@@ -43,18 +24,14 @@ CLASS zcl_po_wbs_r3848 DEFINITION
   PUBLIC SECTION.
 
     " Define structure for final output
-    " NOTE: field order below now matches the RETURN SELECT column order
-    " (ebeln, zzidnumber, brtwr, zzpartnumber - previously brtwr/zzidnumber
-    " were swapped relative to the actual output, which was misleading
-    " documentation even though HANA binds table-function output by name).
     TYPES: BEGIN OF ty_final,
              mandt          TYPE char3,
              pspid_edit     TYPE proj-pspid_edit,
              posid_edit     TYPE prps-posid_edit,
              zzwarpponumber TYPE prps-zzwarpponumber,
              ebeln          TYPE ekpo-ebeln,
-             zzidnumber     TYPE afvu-zzidnumber,
              brtwr          TYPE ekpo-brtwr,
+             zzidnumber     TYPE afvu-zzidnumber,
              zzpartnumber   TYPE prps-zzpartnumber,
              wempf          TYPE resb-wempf,
              rmwwr          TYPE rbkp-rmwwr,
@@ -182,7 +159,7 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
   -- 3. Aggregate existing COOI values
   --
   -- This uses the existing custom COOI source only.
-  -- REFBT = '020' is retained from the original implementation.
+  -- REFΒT = '020' is retained from the original implementation.
   ----------------------------------------------------------------------
   it_cooi =
     SELECT
@@ -211,27 +188,14 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
 
   ----------------------------------------------------------------------
   -- 5. Read reservation recipient data
-  --
-  -- FIX: a single EBELN can have several RESB items with different
-  -- WEMPF values. Previously this was joined to the final result by
-  -- EBELN alone, which fanned every PO/invoice row out once per
-  -- distinct recipient and duplicated all monetary columns for that
-  -- row. Since ty_final carries a single WEMPF field (not a list), we
-  -- collapse to ONE deterministic recipient per EBELN here so the
-  -- join in step 10 can never multiply rows. If the business actually
-  -- needs every recipient represented, WEMPF must become a separate
-  -- 1:N output (a different report shape), not a flat field.
   ----------------------------------------------------------------------
   it_resb =
-    SELECT
+    SELECT DISTINCT
       ebeln,
-      MIN( wempf ) AS wempf
+      wempf
     FROM zr_resb_atc
     WHERE ebeln IS NOT NULL
-      AND ebeln <> ''
-      AND wempf IS NOT NULL
-      AND wempf <> ''
-    GROUP BY ebeln;
+      AND ebeln <> '';
 
 
   ----------------------------------------------------------------------
@@ -257,13 +221,6 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
       AND nplnr.pspnr = pr.pspnr
     LEFT OUTER JOIN :it_cooi AS cooi
       ON cooi.objnr = pr.objnr
-    -- NOTE: RIGHT(pr.objnr, 8) assumes OBJNR = 2-char object type + an
-    -- 8-digit key (matches PRPS internal number PSPNR length). This is
-    -- consistent with how OBJNR is built for WBS elements, but it is a
-    -- positional/magic-number dependency - if that layout ever changes
-    -- (e.g. a different object type prefix length), this join silently
-    -- stops matching instead of failing loudly. Left as-is functionally;
-    -- flagged here so it isn't mistaken for an accident.
     LEFT OUTER JOIN :it_afvu AS afvu
       ON  afvu.projn = RIGHT( pr.objnr, 8 )
       AND afvu.usr03 = pr.zzwarpponumber;
@@ -284,46 +241,7 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
 
 
   ----------------------------------------------------------------------
-  -- 7a. Count how many distinct WBS elements share the same PO
-  --
-  -- FIX (double counting): step 8 used to attach the FULL PO value
-  -- (summed EKPO-BRTWR) to every (EBELN, PSPID_EDIT, POSID_EDIT)
-  -- combination found for that PO. If one PO is linked to N different
-  -- WBS elements, the report showed N x the PO's real value once
-  -- totals were rolled up. This count lets step 8 split the PO value
-  -- evenly across those N combinations instead of repeating it in full.
-  --
-  -- This is a documented approximation (equal split), not a true
-  -- account-assignment-based apportionment. If/when a real percentage
-  -- is available (e.g. a distribution-percent field on
-  -- I_PurOrdAccountAssignmentAPI01), replace the even split below with
-  -- a weighted one.
-  ----------------------------------------------------------------------
-  it_po_share_count =
-    SELECT
-      mandt,
-      ebeln,
-      COUNT( DISTINCT pspid_edit || '/' || posid_edit ) AS share_cnt
-    FROM :it_po_keys
-    GROUP BY mandt, ebeln;
-
-
-  ----------------------------------------------------------------------
   -- 8. Aggregate PO item values
-  --
-  -- FIX: BRTWR is now divided by the number of WBS elements sharing
-  -- this PO (see 7a) so the PO's value is not duplicated in full for
-  -- each one.
-  --
-  -- FIX (LOEKZ): MAX() is used instead of MIN(). LOEKZ is either ' '
-  -- (not deleted) or 'L' (deleted); MIN() always picked ' ' whenever
-  -- at least one item was NOT deleted, which hid a partially deleted
-  -- PO. MAX() surfaces 'L' if ANY item on the PO was deleted.
-  --
-  -- NOTE (BANFN): still an arbitrary representative when a PO has
-  -- items from multiple requisitions - there is no single "correct"
-  -- value to pick here without changing BANFN into a list. MIN() is
-  -- kept only for a deterministic (repeatable) result.
   ----------------------------------------------------------------------
   it_po_total =
     SELECT
@@ -331,31 +249,35 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
       keys.ebeln,
       keys.pspid_edit,
       keys.posid_edit,
-      COALESCE( SUM( ekpo.brtwr ), 0 )
-        / NULLIF( cnt.share_cnt, 0 ) AS brtwr,
-      MAX( ekpo.loekz ) AS loekz,
+      COALESCE( SUM( ekpo.brtwr ), 0 ) AS brtwr,
+      MIN( ekpo.loekz ) AS loekz,
       MIN( ekpo.banfn ) AS banfn
     FROM :it_po_keys AS keys
-    LEFT OUTER JOIN :it_po_share_count AS cnt
-      ON  cnt.mandt = keys.mandt
-      AND cnt.ebeln = keys.ebeln
     LEFT OUTER JOIN zr_ekpo_atc AS ekpo
       ON ekpo.purchaseorder = keys.ebeln
     GROUP BY
       keys.mandt,
       keys.ebeln,
       keys.pspid_edit,
-      keys.posid_edit,
-      cnt.share_cnt;
+      keys.posid_edit;
 
 
   ----------------------------------------------------------------------
   -- 9. Read supplier invoice references
+  --
+  -- FIX: FiscalYear is now carried alongside the PO/invoice keys so
+  -- RBKP can be joined on BELNR + GJAHR in step 10 instead of BELNR
+  -- alone (invoice document numbers repeat across fiscal years).
+  -- SupplierInvoiceItem is intentionally NOT selected here - adding it
+  -- would make this SELECT DISTINCT produce one row per invoice line
+  -- instead of one row per (PO, invoice), re-fanning-out the RBKP
+  -- header join for any invoice with multiple lines against the PO.
   ----------------------------------------------------------------------
   it_invoice_reference =
     SELECT DISTINCT
       purchaseorder,
-      supplierinvoice
+      supplierinvoice,
+      FiscalYear
     FROM i_suplrinvcitempurordrefapi01
     WHERE purchaseorder IS NOT NULL
       AND purchaseorder <> ''
@@ -365,43 +287,7 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
 
   ----------------------------------------------------------------------
   -- 10. Build final report data
-  --
-  -- FIX (fiscal year): RBKP is now joined on BELNR *and* GJAHR.
-  -- Invoice document numbers (BELNR) are only unique within a fiscal
-  -- year - joining on BELNR alone let documents from unrelated years
-  -- match and attach the wrong invoice's header data to a PO. Since
-  -- i_suplrinvcitempurordrefapi01 does not expose a fiscal year here,
-  -- GJAHR is derived by taking the earliest RBKP entry per BELNR that
-  -- also has a matching document (see it_invoice_reference_yr below);
-  -- if your system needs true multi-year disambiguation, expose fiscal
-  -- year from i_suplrinvcitempurordrefapi01 (it is normally available
-  -- on the underlying RSEG-based API) and join on it directly instead
-  -- of this fallback.
-  --
-  -- REMAINING LIMITATION (documented, not fixed here): RMWWR/WMWST1
-  -- are RBKP *header* amounts. If one invoice covers several purchase
-  -- orders, every one of those POs' rows will show the SAME header
-  -- amount - it is not apportioned per PO. Apportioning correctly
-  -- requires invoice ITEM data (RSEG: EBELN/EBELP/item amount), which
-  -- is not among the sources passed to this table function. Add that
-  -- CDS view to the USING list and join on EBELN/EBELP before trusting
-  -- RMWWR/WMWST1-derived totals across multiple POs.
-  --
-  -- FIX (recipient fan-out): resb is now the pre-aggregated,
-  -- one-row-per-EBELN version from step 5, so joining it here can no
-  -- longer multiply rows the way the raw distinct (ebeln, wempf) list
-  -- did.
   ----------------------------------------------------------------------
-  it_invoice_reference_yr =
-    SELECT
-      inv.purchaseorder,
-      inv.supplierinvoice,
-      MIN( rbkp.gjahr ) AS gjahr
-    FROM :it_invoice_reference AS inv
-    INNER JOIN zr_rbkp_atc AS rbkp
-      ON rbkp.belnr = inv.supplierinvoice
-    GROUP BY inv.purchaseorder, inv.supplierinvoice;
-
   it_data =
     SELECT DISTINCT
       pr.mandt,
@@ -473,11 +359,11 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
       AND po.ebeln = pr.ebeln
       AND po.pspid_edit = pr.pspid_edit
       AND po.posid_edit = pr.posid_edit
-    LEFT OUTER JOIN :it_invoice_reference_yr AS inv_ref
+    LEFT OUTER JOIN :it_invoice_reference AS inv_ref
       ON inv_ref.purchaseorder = pr.ebeln
     LEFT OUTER JOIN zr_rbkp_atc AS rbkp
       ON  rbkp.belnr = inv_ref.supplierinvoice
-      AND rbkp.gjahr = inv_ref.gjahr
+      AND rbkp.gjahr = inv_ref.fiscalyear
     LEFT OUTER JOIN :it_resb AS resb
       ON resb.ebeln = pr.ebeln
     WHERE pr.mandt = :p_client
@@ -544,5 +430,7 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
     FROM :it_data;
 
 ENDMETHOD.
+
+
 
 ENDCLASS.
