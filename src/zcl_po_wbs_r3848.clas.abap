@@ -13,6 +13,12 @@
 *--*&                            of BELNR alone, to avoid matching        *
 *--*&                            invoice documents from unrelated fiscal  *
 *--*&                            years                                    *
+*--*&  607231     18/08/2026    sd4k920xxx /push the project's PO/OBJNR   *
+*--*&                            scope down into the COOI, AFVU, RESB and *
+*--*&                            invoice-reference lookups (steps 3,4,5,9)*
+*--*&                            instead of scanning those sources        *
+*--*&                            unfiltered and relying on the later      *
+*--*&                            LEFT JOIN to discard irrelevant rows     *
 *--*&----------------------------------------------------------------------*
 *--*&
 *--*&----------------------------------------------------------------------*
@@ -156,10 +162,27 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
 
 
   ----------------------------------------------------------------------
+  -- 2a. Scope: distinct PO numbers relevant to this project
+  --
+  -- Reused below to cut RESB and the invoice-reference API down to
+  -- just this project's purchase orders instead of scanning every PO
+  -- in the system before the LEFT JOIN in step 10 discards the rest.
+  ----------------------------------------------------------------------
+  it_ebeln_scope =
+    SELECT DISTINCT ebeln
+    FROM :it_nplnr
+    WHERE ebeln IS NOT NULL
+      AND ebeln <> '';
+
+
+  ----------------------------------------------------------------------
   -- 3. Aggregate existing COOI values
   --
   -- This uses the existing custom COOI source only.
   -- REFΒT = '020' is retained from the original implementation.
+  --
+  -- Filtered to this project's OBJNR values (from it_prps) so the
+  -- aggregation doesn't sum COOI rows for every other project first.
   ----------------------------------------------------------------------
   it_cooi =
     SELECT
@@ -167,11 +190,16 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
       SUM( whgbtr ) AS whgbtr
     FROM zcds_ptp_cooi_tbdp
     WHERE refbt = '020'
+      AND objnr IN ( SELECT objnr FROM :it_prps )
     GROUP BY objnr;
 
 
   ----------------------------------------------------------------------
   -- 4. Read operation ID-number assignments
+  --
+  -- Filtered to the network numbers that can actually match this
+  -- project's WBS elements (see the RIGHT(objnr, 8) join in step 6)
+  -- instead of reading every network's operations system-wide.
   ----------------------------------------------------------------------
   it_afvu =
     SELECT DISTINCT
@@ -183,11 +211,15 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
       ON  afvu.aufpl = afvc.aufpl
       AND afvu.aplzl = afvc.aplzl
     WHERE afvu.usr03 IS NOT NULL
-      AND afvu.usr03 <> '';
+      AND afvu.usr03 <> ''
+      AND afvc.projn IN ( SELECT RIGHT( objnr, 8 ) FROM :it_prps );
 
 
   ----------------------------------------------------------------------
   -- 5. Read reservation recipient data
+  --
+  -- Filtered to this project's PO scope (it_ebeln_scope) instead of
+  -- reading RESB for every PO in the system.
   ----------------------------------------------------------------------
   it_resb =
     SELECT DISTINCT
@@ -195,7 +227,8 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
       wempf
     FROM zr_resb_atc
     WHERE ebeln IS NOT NULL
-      AND ebeln <> '';
+      AND ebeln <> ''
+      AND ebeln IN ( SELECT ebeln FROM :it_ebeln_scope );
 
 
   ----------------------------------------------------------------------
@@ -272,6 +305,9 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
   -- would make this SELECT DISTINCT produce one row per invoice line
   -- instead of one row per (PO, invoice), re-fanning-out the RBKP
   -- header join for any invoice with multiple lines against the PO.
+  --
+  -- Filtered to this project's PO scope (it_ebeln_scope) instead of
+  -- reading every purchase-order/invoice reference in the system.
   ----------------------------------------------------------------------
   it_invoice_reference =
     SELECT DISTINCT
@@ -282,7 +318,8 @@ METHOD fetch_data BY DATABASE FUNCTION FOR HDB
     WHERE purchaseorder IS NOT NULL
       AND purchaseorder <> ''
       AND supplierinvoice IS NOT NULL
-      AND supplierinvoice <> '';
+      AND supplierinvoice <> ''
+      AND purchaseorder IN ( SELECT ebeln FROM :it_ebeln_scope );
 
 
   ----------------------------------------------------------------------
